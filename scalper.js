@@ -5,6 +5,7 @@
 const axios = require('axios');
 const fs = require('fs');
 require('dotenv').config();
+const executor = require('./executor');
 
 // ============== MODE ==============
 const LIVE_MODE = process.argv.includes('--live');
@@ -14,19 +15,20 @@ const VERBOSE = !process.argv.includes('--quiet');
 const CONFIG = {
   // Timing
   SCAN_INTERVAL_MS: 30000,        // Scan for entries every 30 seconds
-  MONITOR_INTERVAL_MS: 2000,      // Check position every 2 seconds
+  MONITOR_INTERVAL_MS: 500,       // Check position every 500ms (faster = catch dumps quicker)
 
   // Position
   MAX_POSITIONS: 1,               // Focus on ONE trade at a time
   POSITION_SIZE_SOL: 5,           // SOL per trade
 
-  // Entry Rules
+  // Entry Rules (ORIGINAL + PROTECTION)
   MIN_SIGNALS: 1,                 // 1 signal OK if pumping
-  MIN_BUY_SELL_RATIO: 1.0,        // Just needs positive ratio
+  MIN_BUY_SELL_RATIO: 1.0,        // Original: any positive ratio
   MIN_5M_CHANGE: 5,               // Catch pumps early (5%+ in 5min)
-  MAX_5M_CHANGE: 40,              // DON'T BUY TOPS - lowered from 80% to 40%
-  MIN_LIQUIDITY: 8000,            // $8K minimum
+  MAX_5M_CHANGE: 40,              // Original: 40% max (bypassed for fresh sources)
+  MIN_LIQUIDITY: 8000,            // Original: $8K ($2K for pump.fun)
   MAX_AGE_HOURS: 4,               // Focus on fresher tokens (4h max)
+  MIN_AGE_MINUTES: 0,             // Original: no minimum age
 
   // Cooldowns (CRITICAL - prevents re-entry disasters)
   COOLDOWN_MINUTES: 10,           // Don't re-buy ANY token for 10 min after selling
@@ -35,8 +37,12 @@ const CONFIG = {
   // Exit Rules
   TAKE_PROFIT_PERCENT: 5,         // +5% = quick scalp, take profit fast
   STOP_LOSS_PERCENT: -10,         // -10% = cut losses
-  MAX_HOLD_MINUTES: 10,           // Dead trade timeout
+  FLASH_CRASH_PERCENT: -5,        // Exit immediately if price drops 5%+ in ONE check cycle
+  MAX_HOLD_MINUTES: 3,            // Reduced from 10 - exit dead trades faster
   MIN_PROFIT_FOR_HOLD: 5,         // Need +5% to hold past timeout
+
+  // Session Protection
+  SESSION_STOP_LOSS_SOL: 5,       // Stop trading if we drop 5 SOL from peak
 
   // API
   DEXSCREENER_API: 'https://api.dexscreener.com',
@@ -47,6 +53,8 @@ const CONFIG = {
 let currentPosition = null;
 let stats = { trades: 0, wins: 0, losses: 0, totalPnl: 0 };
 let isScanning = false;
+let peakPnl = 0;                      // Track peak P&L for session stop-loss
+let sessionStopped = false;           // Flag to stop trading after session stop-loss
 
 // Cooldown tracking
 let tokenCooldowns = new Map();      // address -> { time, wasProfit }
@@ -377,8 +385,34 @@ function checkExitRules(position, currentPrice) {
 
 // ============== TRADE EXECUTION ==============
 
-function executeBuy(token) {
+async function executeBuy(token) {
   const mode = LIVE_MODE ? '🔴 LIVE' : '📝 PAPER';
+
+  console.log('');
+  console.log('┌─────────────────────────────────────────────────────────────┐');
+  console.log(`│  🟢 ${mode} BUY ${token.symbol}`);
+  console.log('├─────────────────────────────────────────────────────────────┤');
+  console.log(`│  💵 Price: $${token.priceUsd.toFixed(8)}`);
+  console.log(`│  📦 Size: ${CONFIG.POSITION_SIZE_SOL} SOL`);
+  console.log(`│  📊 5m: +${token.priceChange5m.toFixed(1)}% | Ratio: ${token.buySellRatio.toFixed(2)} | Liq: $${(token.liquidity/1000).toFixed(0)}K`);
+  console.log(`│  🎯 TP: +${CONFIG.TAKE_PROFIT_PERCENT}% | SL: ${CONFIG.STOP_LOSS_PERCENT}% | Timeout: ${CONFIG.MAX_HOLD_MINUTES}min`);
+
+  // Execute real trade in LIVE mode
+  if (LIVE_MODE) {
+    console.log('│  ⏳ Executing Jupiter swap...');
+    const result = await executor.executeBuy(token.address, CONFIG.POSITION_SIZE_SOL, false);
+
+    if (!result.success) {
+      console.log(`│  ❌ Buy FAILED: ${result.error}`);
+      console.log('└─────────────────────────────────────────────────────────────┘');
+      console.log('');
+      return false;
+    }
+    console.log(`│  ✅ TX: ${result.txHash}`);
+  }
+
+  console.log('└─────────────────────────────────────────────────────────────┘');
+  console.log('');
 
   currentPosition = {
     address: token.address,
@@ -390,28 +424,17 @@ function executeBuy(token) {
 
   // Mark as seen
   seenTokens.add(token.address);
-
-  console.log('');
-  console.log('┌─────────────────────────────────────────────────────────────┐');
-  console.log(`│  🟢 ${mode} BUY ${token.symbol}`);
-  console.log('├─────────────────────────────────────────────────────────────┤');
-  console.log(`│  💵 Price: $${token.priceUsd.toFixed(8)}`);
-  console.log(`│  📦 Size: ${CONFIG.POSITION_SIZE_SOL} SOL`);
-  console.log(`│  📊 5m: +${token.priceChange5m.toFixed(1)}% | Ratio: ${token.buySellRatio.toFixed(2)} | Liq: $${(token.liquidity/1000).toFixed(0)}K`);
-  console.log(`│  🎯 TP: +${CONFIG.TAKE_PROFIT_PERCENT}% | SL: ${CONFIG.STOP_LOSS_PERCENT}% | Timeout: ${CONFIG.MAX_HOLD_MINUTES}min`);
-  console.log('└─────────────────────────────────────────────────────────────┘');
-  console.log('');
-
   stats.trades++;
+  return true;
 }
 
-function executeSell(reason, currentPrice, pnlPercent) {
+async function executeSell(reason, currentPrice, pnlPercent) {
   const mode = LIVE_MODE ? '🔴 LIVE' : '📝 PAPER';
   const pnlSol = (pnlPercent / 100) * currentPosition.solAmount;
   const wasProfit = pnlPercent >= 0;
 
   const emoji = wasProfit ? '🟢' : '🔴';
-  const reasonEmoji = reason === 'TAKE_PROFIT' ? '🎯' : reason === 'STOP_LOSS' ? '🛑' : '⏰';
+  const reasonEmoji = reason === 'TAKE_PROFIT' ? '🎯' : reason === 'STOP_LOSS' ? '🛑' : reason === 'FLASH_CRASH' ? '⚡' : '⏰';
   const holdTime = ((Date.now() - currentPosition.entryTime) / 60000).toFixed(1);
 
   console.log('');
@@ -421,6 +444,23 @@ function executeSell(reason, currentPrice, pnlPercent) {
   console.log(`│  ${reasonEmoji} Reason: ${reason}`);
   console.log(`│  💵 Exit: $${currentPrice.toFixed(8)} (Entry: $${currentPosition.entryPrice.toFixed(8)})`);
   console.log(`│  ⏱️  Hold Time: ${holdTime} minutes`);
+
+  // Execute real trade in LIVE mode
+  if (LIVE_MODE) {
+    console.log('│  ⏳ Executing Jupiter swap (selling 100%)...');
+    const result = await executor.executeSell(currentPosition.address, 100, false);
+
+    if (!result.success) {
+      console.log(`│  ❌ Sell FAILED: ${result.error}`);
+      console.log(`│  ⚠️  POSITION STILL OPEN - manual intervention needed!`);
+      console.log('└─────────────────────────────────────────────────────────────┘');
+      console.log('');
+      // Don't clear position if sell failed - need to retry
+      return false;
+    }
+    console.log(`│  ✅ TX: ${result.txHash}`);
+  }
+
   console.log('├─────────────────────────────────────────────────────────────┤');
   console.log(`│  ${emoji} P&L: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(2)} SOL)`);
   console.log('└─────────────────────────────────────────────────────────────┘');
@@ -442,8 +482,21 @@ function executeSell(reason, currentPrice, pnlPercent) {
   }
   stats.totalPnl += pnlSol;
 
+  // Track peak P&L for session stop-loss
+  if (stats.totalPnl > peakPnl) {
+    peakPnl = stats.totalPnl;
+  }
+
+  // Check session stop-loss
+  if (stats.totalPnl < peakPnl - CONFIG.SESSION_STOP_LOSS_SOL) {
+    sessionStopped = true;
+    log(`⛔ SESSION STOP-LOSS HIT! Dropped ${(peakPnl - stats.totalPnl).toFixed(2)} SOL from peak of +${peakPnl.toFixed(2)}`);
+    log(`🛑 Trading paused to protect capital. Restart bot to continue.`);
+  }
+
   currentPosition = null;
   printStats();
+  return true;
 }
 
 function printStats() {
@@ -463,24 +516,66 @@ async function monitorPosition() {
     return;
   }
 
+  // Flash crash detection - check price change since LAST check (not just entry)
+  const lastPrice = currentPosition.lastCheckedPrice || currentPosition.entryPrice;
+  const cycleChange = ((token.priceUsd - lastPrice) / lastPrice) * 100;
+  currentPosition.lastCheckedPrice = token.priceUsd;  // Update for next cycle
+
+  // If price dropped more than FLASH_CRASH_PERCENT in one cycle, exit immediately
+  if (cycleChange <= CONFIG.FLASH_CRASH_PERCENT) {
+    const pnlPercent = ((token.priceUsd - currentPosition.entryPrice) / currentPosition.entryPrice) * 100;
+    log(`⚡ FLASH CRASH detected! Price dropped ${cycleChange.toFixed(1)}% in 1 second`);
+    await executeSell('FLASH_CRASH', token.priceUsd, pnlPercent);
+    return;
+  }
+
   const exitCheck = checkExitRules(currentPosition, token.priceUsd);
 
   if (exitCheck.shouldExit) {
-    executeSell(exitCheck.reason, token.priceUsd, exitCheck.pnlPercent);
+    await executeSell(exitCheck.reason, token.priceUsd, exitCheck.pnlPercent);
   } else {
     const pnl = exitCheck.pnlPercent;
     const mins = exitCheck.holdMinutes.toFixed(1);
-    const emoji = pnl >= 0 ? '📈' : '📉';
     const pnlSol = (pnl / 100) * currentPosition.solAmount;
 
+    // Visual indicator based on P&L
+    let status, emoji;
+    if (pnl >= CONFIG.TAKE_PROFIT_PERCENT * 0.8) {
+      status = '🚀 ALMOST TP!';
+      emoji = '🟢';
+    } else if (pnl >= 2) {
+      status = '📈 Profit';
+      emoji = '🟢';
+    } else if (pnl >= 0) {
+      status = '➡️  Flat';
+      emoji = '⚪';
+    } else if (pnl > CONFIG.STOP_LOSS_PERCENT * 0.8) {
+      status = '📉 Dipping';
+      emoji = '🟡';
+    } else {
+      status = '⚠️  NEAR SL!';
+      emoji = '🔴';
+    }
+
     // Progress bar for TP/SL (-10% to +5%)
-    const progress = Math.min(100, Math.max(0, (pnl + 10) / 15 * 100));
-    const barLen = 20;
+    const progress = Math.min(100, Math.max(0, (pnl - CONFIG.STOP_LOSS_PERCENT) / (CONFIG.TAKE_PROFIT_PERCENT - CONFIG.STOP_LOSS_PERCENT) * 100));
+    const barLen = 15;
     const filled = Math.round(progress / 100 * barLen);
     const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
 
-    process.stdout.write(`\r${' '.repeat(100)}\r`);
-    process.stdout.write(`${emoji} ${currentPosition.symbol} | ${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}% (${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(2)} SOL) | SL[${bar}]TP | ⏱️${mins}m`);
+    // Calculate target prices
+    const tpPrice = currentPosition.entryPrice * (1 + CONFIG.TAKE_PROFIT_PERCENT / 100);
+    const slPrice = currentPosition.entryPrice * (1 + CONFIG.STOP_LOSS_PERCENT / 100);
+
+    // Clear line and print improved status
+    process.stdout.write(`\r${' '.repeat(130)}\r`);
+    process.stdout.write(
+      `${emoji} ${currentPosition.symbol.padEnd(10)} | ` +
+      `${status.padEnd(12)} | ` +
+      `P&L: ${(pnl >= 0 ? '+' : '') + pnl.toFixed(1)}% (${(pnlSol >= 0 ? '+' : '') + pnlSol.toFixed(2)} SOL) | ` +
+      `${CONFIG.STOP_LOSS_PERCENT}%[${bar}]+${CONFIG.TAKE_PROFIT_PERCENT}% | ` +
+      `⏱️ ${mins}m`
+    );
   }
 }
 
@@ -489,6 +584,7 @@ async function monitorPosition() {
 async function scanForEntry() {
   if (currentPosition) return;
   if (isScanning) return;
+  if (sessionStopped) return;  // Session stop-loss hit - don't trade
 
   isScanning = true;
   const scanStart = Date.now();
@@ -507,22 +603,22 @@ async function scanForEntry() {
     ]);
 
     // Combine and deduplicate, tracking sources
-    // PRIORITY ORDER: Fresh pump.fun tokens FIRST, then other sources
+    // PRIORITY ORDER: GECKO_NEW first (better liquidity), then pump.fun
     const tokenMap = new Map();
 
-    // 1. PUMP_FUN tokens first (freshest, highest priority)
-    for (const t of geckoNew) {
-      if (t.source === 'PUMP_FUN' && t.address && !tokenMap.has(t.address)) {
-        tokenMap.set(t.address, new Set());
-      }
-      if (t.source === 'PUMP_FUN' && t.address) tokenMap.get(t.address)?.add('PUMP_FUN');
-    }
-    // 2. Other GECKO_NEW tokens (fresh but not pump.fun)
+    // 1. GECKO_NEW tokens first (better liquidity, less likely to rug)
     for (const t of geckoNew) {
       if (t.source === 'GECKO_NEW' && t.address && !tokenMap.has(t.address)) {
         tokenMap.set(t.address, new Set());
       }
       if (t.source === 'GECKO_NEW' && t.address) tokenMap.get(t.address)?.add('GECKO_NEW');
+    }
+    // 2. PUMP_FUN tokens second (higher rug risk but fresh)
+    for (const t of geckoNew) {
+      if (t.source === 'PUMP_FUN' && t.address && !tokenMap.has(t.address)) {
+        tokenMap.set(t.address, new Set());
+      }
+      if (t.source === 'PUMP_FUN' && t.address) tokenMap.get(t.address)?.add('PUMP_FUN');
     }
     // 3. Gecko trending
     for (const t of geckoTrend) {
@@ -612,7 +708,7 @@ async function scanForEntry() {
       if (strongPump && !signalList.includes('PUMP5M')) signalList.push('PUMP5M');
       const effectiveSignals = signalCount + (strongPump ? 1 : 0);
 
-      // For fresh tokens (GECKO_NEW or PUMP_FUN), relax some filters
+      // Track source type for special handling
       const isGeckoFresh = sources.has('GECKO_NEW');
       const isPumpFun = sources.has('PUMP_FUN');
       const isFreshSource = isGeckoFresh || isPumpFun;
@@ -620,13 +716,17 @@ async function scanForEntry() {
       // Lower liquidity requirement for pump.fun tokens (they start small)
       const minLiquidity = isPumpFun ? 2000 : CONFIG.MIN_LIQUIDITY;
 
+      // Calculate age in minutes for min age check
+      const ageMinutes = token.ageHours * 60;
+
       const checks = {
         hasSignals: effectiveSignals >= CONFIG.MIN_SIGNALS,
         goodRatio: token.buySellRatio >= CONFIG.MIN_BUY_SELL_RATIO,
         isPumping: token.priceChange5m >= CONFIG.MIN_5M_CHANGE,
-        notTopped: isFreshSource ? true : token.priceChange5m <= CONFIG.MAX_5M_CHANGE,  // Skip for fresh tokens
-        hasLiquidity: token.liquidity >= minLiquidity,
-        isFresh: token.ageHours <= CONFIG.MAX_AGE_HOURS,
+        notTopped: isFreshSource ? true : token.priceChange5m <= CONFIG.MAX_5M_CHANGE,  // Bypass for fresh sources
+        hasLiquidity: token.liquidity >= minLiquidity,           // $2K for pump.fun, $8K for others
+        notTooOld: token.ageHours <= CONFIG.MAX_AGE_HOURS,
+        oldEnough: CONFIG.MIN_AGE_MINUTES === 0 ? true : ageMinutes >= CONFIG.MIN_AGE_MINUTES,
         notDumping: token.priceChange5m > -5,
       };
 
@@ -637,12 +737,12 @@ async function scanForEntry() {
         const passIcon = pass ? '✅' : '❌';
         const fails = [];
         if (!checks.hasSignals) fails.push(`sig:${effectiveSignals}<1`);
-        if (!checks.goodRatio) fails.push(`ratio:${token.buySellRatio.toFixed(1)}<1.0`);
-        if (!checks.isPumping) fails.push(`5m:${token.priceChange5m.toFixed(1)}%<5%`);
-        if (!checks.notTopped) fails.push(`TOPPED:${token.priceChange5m.toFixed(0)}%>40%`);
-        // Note: GECKO_NEW tokens bypass the topped check
+        if (!checks.goodRatio) fails.push(`ratio:${token.buySellRatio.toFixed(1)}<${CONFIG.MIN_BUY_SELL_RATIO}`);
+        if (!checks.isPumping) fails.push(`5m:${token.priceChange5m.toFixed(1)}%<${CONFIG.MIN_5M_CHANGE}%`);
+        if (!checks.notTopped) fails.push(`TOPPED:${token.priceChange5m.toFixed(0)}%>${CONFIG.MAX_5M_CHANGE}%`);
         if (!checks.hasLiquidity) fails.push(`liq:$${(token.liquidity/1000).toFixed(0)}K<$${minLiquidity/1000}K`);
-        if (!checks.isFresh) fails.push(`OLD:${token.ageHours.toFixed(1)}h>4h`);
+        if (!checks.notTooOld) fails.push(`OLD:${token.ageHours.toFixed(1)}h>${CONFIG.MAX_AGE_HOURS}h`);
+        if (!checks.oldEnough && CONFIG.MIN_AGE_MINUTES > 0) fails.push(`TOO_NEW:${ageMinutes.toFixed(0)}m<${CONFIG.MIN_AGE_MINUTES}m`);
         if (!checks.notDumping) fails.push(`dump:${token.priceChange5m.toFixed(1)}%`);
 
         const ageStr = token.ageHours < 1 ? `${(token.ageHours * 60).toFixed(0)}m` : `${token.ageHours.toFixed(1)}h`;
@@ -664,7 +764,11 @@ async function scanForEntry() {
       if (pass) {
         console.log('');
         log(`✨ ENTRY SIGNAL: ${token.symbol} (${signalList.join('+')})`);
-        executeBuy(token);
+        const bought = await executeBuy(token);
+        if (!bought) {
+          log(`⚠️ Buy failed, continuing scan...`);
+          continue;  // Try next candidate if buy failed
+        }
         break;
       }
     }
@@ -697,22 +801,58 @@ async function startScalper() {
   console.log('\n' + '═'.repeat(70));
   console.log(`⚡ MOMENTUM SCALPER v3 - ${modeStr}`);
   console.log('═'.repeat(70));
+
+  // LIVE MODE: Verify wallet and balance before starting
   if (LIVE_MODE) {
     console.log('⚠️  WARNING: LIVE MODE - Real money at risk!');
     console.log('═'.repeat(70));
+    console.log('🔐 Checking wallet...');
+
+    // Check private key exists
+    if (!process.env.WALLET_PRIVATE_KEY) {
+      console.log('❌ ERROR: WALLET_PRIVATE_KEY not set in .env');
+      console.log('   Add your Phantom wallet private key to .env file');
+      process.exit(1);
+    }
+
+    // Check balance
+    try {
+      const balance = await executor.getSOLBalance();
+      console.log(`💰 Wallet balance: ${balance.toFixed(4)} SOL`);
+
+      if (balance < CONFIG.POSITION_SIZE_SOL + 0.01) {
+        console.log(`❌ ERROR: Insufficient balance!`);
+        console.log(`   Need at least ${CONFIG.POSITION_SIZE_SOL + 0.01} SOL (position + gas)`);
+        console.log(`   Current balance: ${balance.toFixed(4)} SOL`);
+        process.exit(1);
+      }
+
+      console.log(`✅ Wallet ready - Can execute ${Math.floor(balance / CONFIG.POSITION_SIZE_SOL)} trades`);
+    } catch (err) {
+      console.log(`❌ ERROR: Could not check balance: ${err.message}`);
+      console.log('   Check your WALLET_PRIVATE_KEY and internet connection');
+      process.exit(1);
+    }
+    console.log('═'.repeat(70));
   }
-  console.log(`📊 Entry Rules:`);
-  console.log(`   • 5m change: +${CONFIG.MIN_5M_CHANGE}% to +${CONFIG.MAX_5M_CHANGE}% (avoid buying tops!)`);
-  console.log(`   • Liquidity: $${CONFIG.MIN_LIQUIDITY/1000}K+ | Max age: ${CONFIG.MAX_AGE_HOURS}h`);
-  console.log(`   • Cooldown: ${CONFIG.COOLDOWN_MINUTES}min (${CONFIG.PROFIT_COOLDOWN_MINUTES}min after profit)`);
+  console.log(`📊 Entry Rules (ORIGINAL):`);
+  console.log(`   • Min age: ${CONFIG.MIN_AGE_MINUTES}min (avoid instant rugs)`);
+  console.log(`   • Min ratio: ${CONFIG.MIN_BUY_SELL_RATIO}x (strong momentum only)`);
+  console.log(`   • 5m change: +${CONFIG.MIN_5M_CHANGE}% to +${CONFIG.MAX_5M_CHANGE}%`);
+  console.log(`   • Liquidity: $${CONFIG.MIN_LIQUIDITY/1000}K+ (harder to rug)`);
+  console.log(`   • Max age: ${CONFIG.MAX_AGE_HOURS}h | Cooldown: ${CONFIG.COOLDOWN_MINUTES}min`);
   console.log('');
   console.log(`🎯 Exit Rules:`);
-  console.log(`   • Take Profit: +${CONFIG.TAKE_PROFIT_PERCENT}% (quick scalp)`);
+  console.log(`   • Take Profit: +${CONFIG.TAKE_PROFIT_PERCENT}%`);
   console.log(`   • Stop Loss: ${CONFIG.STOP_LOSS_PERCENT}%`);
+  console.log(`   • Flash Crash: ${CONFIG.FLASH_CRASH_PERCENT}% per cycle`);
   console.log(`   • Timeout: ${CONFIG.MAX_HOLD_MINUTES}min`);
   console.log('');
+  console.log(`🛡️ Session Protection:`);
+  console.log(`   • Stop trading if drop ${CONFIG.SESSION_STOP_LOSS_SOL} SOL from peak`);
+  console.log('');
   console.log(`💰 Position: ${CONFIG.POSITION_SIZE_SOL} SOL per trade`);
-  console.log(`⏱️  Speed: Scan/${CONFIG.SCAN_INTERVAL_MS/1000}s | Monitor/${CONFIG.MONITOR_INTERVAL_MS/1000}s`);
+  console.log(`⏱️  Speed: Scan/${CONFIG.SCAN_INTERVAL_MS/1000}s | Monitor/${CONFIG.MONITOR_INTERVAL_MS}ms`);
   console.log('═'.repeat(70) + '\n');
 
   log('🚀 Starting scalper...');
