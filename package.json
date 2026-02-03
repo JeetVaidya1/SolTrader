@@ -1,0 +1,21 @@
+{
+  "name": "solana-claude-trader",
+  "version": "2.0.0",
+  "description": "Autonomous Solana memecoin trading bot powered by Claude Code (no MCP needed)",
+  "main": "monitor.js",
+  "scripts": {
+    "paper": "node monitor.js",
+    "live": "node monitor.js --live",
+    "scalp": "node scalper.js",
+    "scalp-live": "node scalper.js --live",
+    "balance": "node -e \"require('dotenv').config(); const e=require('./executor'); e.getSOLBalance().then(b=>console.log('SOL Balance:', b))\"",
+    "status": "cat data/state.json | node -e \"const s=require('fs').readFileSync('/dev/stdin','utf8');const d=JSON.parse(s);console.log('P&L:',d.totalPnl,'Positions:',d.positions.length,'Trades:',d.totalTrades)\""
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "axios": "^1.7.0",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.0",
+    "node-cron": "^3.0.0"
+  }
+}

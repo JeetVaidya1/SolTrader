@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Environment variables (contains secrets)
+.env
+
+# State files (contains trading data)
+data/state.json
+data/trade-history.json
+data/decisions.json
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Solana keypair (NEVER commit this)
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
